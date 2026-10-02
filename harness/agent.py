@@ -110,6 +110,7 @@ from dataclasses import dataclass, field
 from arena.model import (
     ARENA_SYSTEM_PROMPT,
     TOOL_ERROR_PREFIX,
+    MockModel,
     parse_output,
 )
 from arena.tools import ToolResult
@@ -280,6 +281,31 @@ ARENA_SYSTEM_PROMPT_REAL = real_model_system_prompt()
 #: grounding points with the gate still passing, i.e. silently. Ordinary
 #: output is three orders of magnitude below this.
 MAX_OUTPUT_TEXT_CHARS = 60_000
+
+
+#: First words of `REAL_MODEL_PROMPT_ADDENDUM`; tells us it is already there.
+_ADDENDUM_MARKER = "PHỤ LỤC GIAO THỨC"
+
+#: How many times ONE RUN may send a FINAL back because some claims are not
+#: a verbatim single line of what the model read. One is enough: the model
+#: is told exactly which claims failed and what "verbatim" means.
+MAX_CLAIM_REPAIRS = 1
+
+
+def _is_mock(model) -> bool:
+    """True if `model`, or anything it wraps, is the offline `MockModel`.
+
+    The frozen runner wraps whatever model it is given in a provenance
+    proxy that keeps the original on `.inner`, so a bare `isinstance` on
+    the object the agent receives is always False.
+    """
+    seen = 0
+    while model is not None and seen < 8:
+        if isinstance(model, MockModel):
+            return True
+        model = getattr(model, "inner", None)
+        seen += 1
+    return False
 
 
 def _canonicalise(text: str) -> str:
@@ -480,6 +506,19 @@ class ReActAgent:
         # one already, so a caller that does not pass one still works.
         self.corpus = corpus if corpus is not None else getattr(tools, "_corpus", None)
         self.max_steps = max(1, int(max_steps))
+        # A real endpoint is not templated to act: it abstains on turn one,
+        # never re-queries and paraphrases instead of quoting. The addendum
+        # answers each of those, so it is on for every non-mock model whether
+        # or not the runner asked for it. The mock keeps the bare prompt: its
+        # token estimator would bill ~700 tokens a turn for nothing.
+        self.is_mock = _is_mock(model)
+        # It rides as a SECOND system message, so the first one stays exactly
+        # the prompt the runner configured.
+        self.protocol_addendum = (
+            ""
+            if self.is_mock or _ADDENDUM_MARKER in system_prompt
+            else REAL_MODEL_PROMPT_ADDENDUM.strip()
+        )
         self.system_prompt = system_prompt
         self.last_context: AgentContext | None = None
         # Per-run bookkeeping for the two `_parse` guards. Reset in
@@ -487,6 +526,7 @@ class ReActAgent:
         # belongs to the layers.
         self._final_deferrals = 0
         self._refused_final: dict | None = None
+        self._claim_repairs = 0
 
     # -- the run -------------------------------------------------------
 
@@ -503,6 +543,7 @@ class ReActAgent:
         self.last_context = ctx
         self._final_deferrals = 0
         self._refused_final = None
+        self._claim_repairs = 0
 
         self.trace.emit("agent_start", brief_id=str(brief.get("brief_id", "")))
 
@@ -510,6 +551,8 @@ class ReActAgent:
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": ctx.question},
         ]
+        if self.protocol_addendum:
+            ctx.messages.insert(1, {"role": "system", "content": self.protocol_addendum})
         self.middleware.before_agent(ctx)
 
         report: dict = {}
@@ -533,6 +576,11 @@ class ReActAgent:
 
             if parsed.kind == "final":
                 report = parsed.final if isinstance(parsed.final, dict) else {}
+                feedback = self._claim_feedback(ctx, report)
+                if feedback and step + 1 < self.max_steps:
+                    self._claim_repairs += 1
+                    ctx.messages.append({"role": "user", "content": feedback})
+                    continue
                 ctx.stop_reason = "final"
                 break
 
@@ -558,6 +606,39 @@ class ReActAgent:
         # runner stamps its own `agent_end` with the timing it measured.
         self.trace.emit("agent_end", stop_reason=ctx.stop_reason, steps=ctx.step + 1)
         return report
+
+    # -- checking the model's quotations ----------------------------------
+
+    def _claim_feedback(self, ctx: AgentContext, report: dict) -> str:
+        """A message sending a FINAL back, or "" if it can stand.
+
+        A claim only scores if it is a verbatim copy of one LINE of a
+        document the run actually read. A real model paraphrases, joins
+        two lines or adds a full stop, and `critic` then has to delete the
+        claim. Asking the model once to re-quote is cheaper than losing
+        the recall. Mock runs skip this: the mock never reads feedback.
+        """
+        if self.is_mock or self._claim_repairs >= MAX_CLAIM_REPAIRS:
+            return ""
+        claims = report.get("claims") if isinstance(report, dict) else None
+        if not isinstance(claims, list) or not claims or report.get("abstain") is True:
+            return ""
+        lines = ctx.observed_text.splitlines()
+        bad = []
+        for claim in claims:
+            text = claim.get("text") if isinstance(claim, dict) else None
+            if not isinstance(text, str) or not any(text and text in ln for ln in lines):
+                bad.append(text if isinstance(text, str) else str(claim))
+        if not bad:
+            return ""
+        shown = "; ".join("«" + t[:70] + "»" for t in bad[:4])
+        return (
+            "Các câu trích sau KHÔNG nằm nguyên văn trong MỘT dòng của tài liệu bạn đã "
+            f"đọc: {shown}. Hãy viết lại dòng kết luận: chỉ giữ những câu chép đúng từng "
+            "ký tự từ một dòng của tài liệu đã đọc (được cắt bớt ở hai đầu, không được "
+            "sửa, không thêm dấu chấm, không ghép dòng). Nếu không có câu nào như vậy, "
+            "đặt abstain là đúng và claims là mảng rỗng. Không gọi thêm công cụ."
+        )
 
     # -- reading the model ---------------------------------------------
 

@@ -78,17 +78,92 @@ class Critic(Middleware):
 
     name = "critic"
 
+    #: Ký tự một mô hình thật hay thêm vào hai đầu một câu trích.
+    _EDGE = " \t\"'“”‘’.…;:,*•-"
+
+    def _rescue(self, ctx, text):
+        """Cắt (không sửa) một claim gần đúng về một đoạn nằm gọn trong MỘT dòng.
+
+        Mô hình thật hay thêm dấu chấm, nháy, gạch đầu dòng hay "..." ở hai đầu,
+        hoặc dán nhiều dòng thành một. Bỏ phần thừa là cắt bớt: kết quả vẫn
+        là substring của chính chữ mô hình viết, nên còn nguyên provenance.
+        """
+        pieces = [text] if "\n" not in text else sorted(text.splitlines(), key=len, reverse=True)
+        for piece in pieces:
+            trimmed = piece.strip(self._EDGE)
+            if len(trimmed) >= 20 and ctx.saw(trimmed) and self._source(ctx, trimmed):
+                return trimmed
+        return None
+
+    @staticmethod
+    def _source(ctx, text):
+        """doc_id của tài liệu có MỘT DÒNG chứa `text` và đã được quan sát."""
+        if ctx.corpus is None:
+            return None
+        for doc in ctx.corpus.docs:
+            if any(text in line for line in doc.body.splitlines()) and ctx.saw(text):
+                return doc.doc_id
+        return None
+
+    def _split(self, ctx, text):
+        """Tách câu ghép tại " và " thành hai nửa thuộc hai tài liệu khác nhau."""
+        start = 0
+        while True:
+            at = text.find(" và ", start)
+            if at == -1:
+                return None
+            left, right = text[:at].strip(), text[at + 4:].strip()
+            start = at + 1
+            if not left or not right:
+                continue
+            a, b = self._source(ctx, left), self._source(ctx, right)
+            if a and b and a != b:
+                return [{"text": left, "doc_id": a}, {"text": right, "doc_id": b}]
+
+    @staticmethod
+    def _dedupe(claims):
+        """Bỏ claim lặp và giữ tối đa 4 claim mỗi tài liệu (quá thì bị chấm REDUNDANT)."""
+        seen, per_doc, out = set(), {}, []
+        for claim in claims:
+            key = (claim.get("text"), claim.get("doc_id"))
+            if key in seen or per_doc.get(claim.get("doc_id"), 0) >= 4:
+                continue
+            seen.add(key)
+            per_doc[claim.get("doc_id")] = per_doc.get(claim.get("doc_id"), 0) + 1
+            out.append(claim)
+        return out[:10]
+
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+        kept, merged = [], False
+        for claim in claims:
+            text = claim.get("text") if isinstance(claim, dict) else None
+            if not isinstance(text, str) or not text:
+                continue
+            if ctx.saw(text) and "\n" not in text:
+                kept.append(claim)
+                continue
+            halves = self._split(ctx, text)
+            if halves:
+                kept.extend(halves)
+                merged = True
+                continue
+            rescued = self._rescue(ctx, text)
+            if rescued:
+                claim["text"] = rescued
+                kept.append(claim)
+        kept = self._dedupe(kept)
+        report["claims"] = kept
+        if merged:
+            report["abstain"] = True
+        if not kept:
+            report["abstain"] = True
+            report["citations"] = []
+            report["answer"] = (
+                "Không đủ căn cứ trong các tài liệu đã đọc để trả lời câu hỏi này."
+            )
+        else:
+            report["citations"] = sorted({c["doc_id"] for c in kept if c.get("doc_id")})
+        return report

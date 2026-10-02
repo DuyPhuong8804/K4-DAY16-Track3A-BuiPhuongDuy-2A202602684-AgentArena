@@ -61,7 +61,9 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
-from arena.model import is_degraded  # noqa: F401  (dùng trong phần TODO)
+import time
+
+from arena.model import RealModelError, is_degraded
 
 from harness.middleware import Middleware
 
@@ -70,6 +72,15 @@ DEFAULT_MAX_ATTEMPTS = 3
 
 #: Số lượt để dành cho `submit` mà agent vẫn còn phải gọi.
 DEFAULT_RESERVE = 1
+
+
+#: Tổng số lần gọi mô hình cho MỘT lượt, tính cả lần đầu. Một lỗi mạng thoáng
+#: qua (timeout, 429, 5xx) mà không thử lại sẽ giết cả lượt chạy: điểm 0.
+DEFAULT_MODEL_ATTEMPTS = 3
+
+#: Chờ giữa hai lần thử lại, nhân với số lần đã thử (giây). Giữ nhỏ vì
+#: wall clock cũng được chấm.
+MODEL_BACKOFF = 0.5
 
 
 class Retry(Middleware):
@@ -85,6 +96,24 @@ class Retry(Middleware):
         self.max_attempts = max(1, int(max_attempts))
         self.reserve = max(0, int(reserve))
 
+    def wrap_model_call(self, ctx, call, messages):
+        """Thử lại lời gọi mô hình khi endpoint lỗi tạm thời, rồi raise lại.
+
+        Chỉ bắt `RealModelError`. `RunAborted` (trần thời gian / số lượt gọi
+        của runner) là BaseException nên đi xuyên qua: thử lại nó là vô hiệu
+        hoá chính cái trần đó. Hết lượt thử thì raise lại đúng lỗi cũ.
+        """
+        attempts = 1
+        while True:
+            try:
+                return call(messages)
+            except RealModelError:
+                if attempts >= DEFAULT_MODEL_ATTEMPTS:
+                    raise
+                ctx.state["model_retries"] = ctx.state.get("model_retries", 0) + 1
+                time.sleep(MODEL_BACKOFF * attempts)
+                attempts += 1
+
     def wrap_tool_call(self, ctx, call, name, args):
         result = call(name, args)
         # TODO (§7): khoảng 8-12 dòng.
@@ -98,4 +127,14 @@ class Retry(Middleware):
         #  3. Trả về kết quả cuối cùng (kể cả khi vẫn hỏng: agent phải
         #     nhìn thấy sự thật, đừng bịa nội dung thay nó).
         #  4. Ghi số lần đã thử vào ctx.state để gỡ lỗi.
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        attempts = 1
+        while attempts < self.max_attempts and (
+            (not result.ok) or is_degraded(result.content)
+        ):
+            limit = ctx.max_tool_calls
+            if limit is not None and ctx.tools.calls >= limit - self.reserve:
+                break
+            result = call(name, args)
+            attempts += 1
+        ctx.state["retry_attempts"] = ctx.state.get("retry_attempts", 0) + attempts - 1
+        return result
